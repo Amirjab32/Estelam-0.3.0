@@ -1,0 +1,29 @@
+# Project Context Map
+
+## 1. File Map
+- `src/App.tsx`: Root dashboard, 3-tier access gate (Firebase / Cloudflare PIN / Offline), dual-cloud reconciliation, layout/filters, and modals.
+- `src/services/firestoreProducts.ts`: Firestore CRUD/subscriptions for shared `shops/main-shop/products` + `history`, legacy `users/{uid}` migration, and quote math.
+- `src/services/storageSync.ts`: LocalStorage offline bundle (`shop_offline_bundle_v1`), Cloudflare/Express `/api/kv/*` client, tombstone merge (`deletedIds`), JSON backup I/O.
+- `src/firebase.ts` & `firestore.rules`: Firebase init (`firebase-applet-config.json`) and strict field/email-whitelist rules (`isAuthorizedShopMember`).
+- `src/hooks/useBackNavigation.ts`: Modal/detail/bulk-inquiry nav stack synced with `popstate`, standalone PWA sentinel, and Capacitor Android hardware back button.
+- `src/utils/universalScraper.ts`, `clientDigikalaScraper.ts`, `digikalaScraper.ts`, `liveScraper.ts`, `bulkTxtParser.ts`, `productNameMatcher.ts`: Digikala DKP parser, cookie-redirect API fetch, variant selector, HTML inspect parser, `.txt` bulk URL parser, and spec-aware Persian/English name duplicate matcher.
+- `src/utils/barcodeUtils.ts` & `barcodeScannerEngine.ts`: Persian-IME-safe ASCII normalization, 1D-only rules, POS audio/haptics, offline `zxing-wasm`, rear-camera scorer.
+- `src/utils/schedule.ts`, `jalali.ts`, `productFilterSort.ts`: Fixed 3-hour slots (`[0,3,6,9,12,15,18,21]`), Jalali calendar conversion/leap-year/day-bounds helpers, and combined search/category/Jalali-date-range/selling-price filter & sort pipeline (zero prices & dateless legacy items placed at end).
+- `src/components/*`: `ShopHeader`, `RightDrawerMenu`, `ProductCard`, `ProductDetailModal`, `AddProductModal`, `BulkPriceInquiryView`, `ProductSortMenu`, `JalaliDateRangeFilter`, `BarcodeScannerModal`, `CameraBarcodeViewport`, `BarcodeAssigner`, `SchedulerModal`, `OfflineIndicator`, `PWAInstallButton`.
+- `server.ts`: Express + Vite dev/prod server, file/bundle persistence, Cloudflare KV relay, `/api/track-url`, and 3-hour background cron.
+- `public/_worker.js` & `functions/api/*`: Cloudflare Pages Worker (`/api/kv/*`, `/api/track-url`, `env.ASSETS`) and Pages Functions.
+- `electron/main.cjs`, `capacitor.config.ts`, `vite.config.ts`, `wrangler.json`: Electron tray app, Android APK (`CapacitorHttp`), PWA/Workbox, Cloudflare `SHOP_KV`.
+
+## 2. Core Flows & Rules
+- **Storage & Failover (`auto` | `firebase` | `cloudflare` | `offline`)**: Uses Firebase when reachable + whitelisted; fails over via 3-strike hysteresis to Cloudflare KV (salted SHA-256 PIN; fallback `SHOP_PIN` `'1405'`) or `offline-dirty` cache; merges by newest timestamp + `deletedIds`.
+- **Digikala Price Lookup**: Always prefers non-discounted original price (`rrp_price` / `price-no-discount`) over discounted (`selling_price` / `price-final`) in Tomans (API Rials `/ 10`), picking cheapest in-stock marketable variant matching `default_variant` color & size. Uses persistent Cookie Jar (`Expires=` comma-safe), `v1`/`v2` fallback, 4.5s per-fetch timeout + 2-round backoff retry on Edge/Node/Android, 15s client timeout with 1 transient retry, and 550ms debounced `AbortController` lookup in `AddProductModal`. No artificial fluctuations; history appends only on real price change.
+- **Bulk TXT Price Inquiry (`BulkPriceInquiryView`)**: Parses `.txt` lines (ignores blanks + deduplicates by DKP/URL), queries sequentially (concurrency `1`, `950ms` delay, `AbortController`) via untouched `fetchLiveDigikalaProductClient`, supports per-row removal, retries only `error`/`pending` rows, flags duplicates strictly by spec-aware product name matching (`productNameMatcher.ts`) without adding them, and unlocks atomic batch-add (`addBulkProductsToFirestore` / single bundle commit) once the queue finishes or pauses.
+- **Customer Quote Rounding**: `firestoreProducts.ts` / `App.tsx` / `_worker.js` round `price * (1 + margin/100)` to nearest `1,000` Toman; `server.ts` `/api/products` & `schedule.ts` round up to `5,000`.
+- **Barcode Scanner**: Strictly 1D linear formats (`AllLinear` / `NATIVE_1D_DETECTOR_FORMATS`; 2D codes ignored); max `20` barcodes/product (`120` chars). HID listener reads `KeyboardEvent.code` first to bypass Persian keyboard layout. Consecutive duplicate scan of top tray item (`A -> A`) refreshes without incrementing quantity.
+- **3-Hour Scheduler**: Runs at `00, 03, 06, 09, 12, 15, 18, 21` via Node cron in `server.ts`/Electron tray, or client slot check on Android/offline PWA.
+
+## 3. Known Gotchas
+- **Cloudflare Routing Precedence**: `public/_worker.js` copies to `dist/_worker.js` (Advanced Mode) and overrides `functions/api/*` on Pages; keep KV/scraper changes aligned there.
+- **Firestore Rules Strictness**: Only emails listed in `isAuthorizedShopMember()` in `firestore.rules` can access `shops/main-shop`; writes must match exact `hasOnly` keys and `serverTimestamp()`.
+- **Offline & Net-Melli Constraints**: `zxing-wasm` is excluded from Vite `optimizeDeps` and loaded via `?url` for zero-CDN scanning; Android APK bypasses WebView CORS via `CapacitorHttp`.
+- **Electron Tray Persistence**: Closing the Electron window hides it to tray (`isQuitting` flag) so the 3-hour `server.ts` cron keeps updating `shop_bundle_v1.json`.
