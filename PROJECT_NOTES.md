@@ -45,7 +45,7 @@
   - Vite copies `public/_worker.js` to `dist/_worker.js`, overriding `functions/api/*` on Pages; intercepts `/api/*` and serves SPA via `env.ASSETS.fetch(request)`.
   - `resolveShopKv(env)` checks `env.SHOP_KV` first, then scans any KV-capable binding; keys: `shop_bundle_v1` and `shop_pin_auth_v1`.
 - **Build & Server Scripts (`package.json`, `server.ts`)**:
-  - `"type": "module"`, `"dev": "tsx server.ts"`, `"start": "tsx server.ts"`, `"build": "vite build"`, `"lint": "tsc --noEmit"`, `"bundle:electron-server": "node scripts/bundle-electron-server.mjs"`.
+  - `"type": "module"`, `"dev": "tsx server.ts"`, `"start": "tsx server.ts"`, `"build": "vite build"`, `"lint": "tsc --noEmit"`, `"bundle:electron-server": "node scripts/bundle-electron-server.mjs"`; `firebase` pinned to `13.3.0` and `esbuild` at `^0.28.0` for clean `npm install` with `vite@^8.3.0` & `tsx`.
   - `server.ts` mounts Vite `middlewareMode` in dev (with `/@vite/client` stub when `DISABLE_HMR=true`), serves `dist/` in prod, skips auto-start if `SHOP_MANUAL_START=1` (Electron), and relays `/api/kv/*` to `https://estelam-005.pages.dev` (`CLOUDFLARE_RELAY=false` disables).
 - **Vite & TypeScript (`vite.config.ts`, `tsconfig.json`)**:
   - `VitePWA` (`autoUpdate`, `maximumFileSizeToCacheInBytes: 5MB`, `globPatterns` incl. `wasm`, `navigateFallbackDenylist: [/^\/api\//, /^\/_worker\.js/]`, `/api/*` `NetworkOnly`, Google Fonts `CacheFirst`, Digikala images `StaleWhileRevalidate`).
