@@ -46,8 +46,10 @@ function normalizeMargin(raw: unknown): number {
 }
 
 export function calculateCustomerQuote(priceToman: number, marginPercent: number): number {
-  if (priceToman <= 0) return 0;
-  return Math.round((priceToman * (1 + marginPercent / 100)) / 1000) * 1000;
+  if (!Number.isFinite(priceToman) || priceToman <= 0) return 0;
+  const safeMargin =
+    Number.isFinite(marginPercent) && marginPercent >= 0 ? Math.min(500, marginPercent) : 8;
+  return Math.round((priceToman * (1 + safeMargin / 100)) / 1000) * 1000;
 }
 
 function getJalaliNow(): { jalaliDate: string; jalaliTime: string } {
@@ -59,18 +61,23 @@ function getJalaliNow(): { jalaliDate: string; jalaliTime: string } {
 }
 
 function timestampToIso(ts: unknown): string {
-  if (ts instanceof Timestamp) {
-    return ts.toDate().toISOString();
-  }
-  if (typeof ts === 'string' && ts.length > 0) {
-    return ts;
-  }
-  return new Date().toISOString();
+  const optional = timestampToOptionalIso(ts);
+  return optional || new Date().toISOString();
 }
 
 function timestampToOptionalIso(ts: unknown): string {
   if (ts instanceof Timestamp) {
     return ts.toDate().toISOString();
+  }
+  if (ts && typeof (ts as { toDate?: () => Date }).toDate === 'function') {
+    const d = (ts as { toDate: () => Date }).toDate();
+    if (d instanceof Date && Number.isFinite(d.getTime())) {
+      return d.toISOString();
+    }
+  }
+  if (ts && typeof ts === 'object' && typeof (ts as { seconds?: unknown }).seconds === 'number') {
+    const ms = (ts as { seconds: number }).seconds * 1000;
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
   }
   if (typeof ts === 'string' && ts.trim().length > 0) {
     const ms = Date.parse(ts.trim());
@@ -79,11 +86,15 @@ function timestampToOptionalIso(ts: unknown): string {
   return '';
 }
 
-function mapDocToProduct(data: Record<string, any>): ProductItem {
+function mapDocToProduct(data: Record<string, any>, hasPendingWrites = false): ProductItem {
   const currentPrice = toNumber(data.currentPriceToman, 0);
   const margin = normalizeMargin(data.marginPercent ?? 8);
   const quote = toNumber(data.customerQuoteToman, calculateCustomerQuote(currentPrice, margin));
   const createdIso = timestampToOptionalIso(data.createdAt);
+  const refreshedIso = timestampToOptionalIso(data.lastRefreshedAt);
+  const updatedIso = timestampToOptionalIso(data.updatedAt);
+  const effectiveUpdatedAt =
+    updatedIso || (hasPendingWrites ? new Date().toISOString() : refreshedIso || createdIso);
 
   return {
     id: String(data.id),
@@ -102,9 +113,9 @@ function mapDocToProduct(data: Record<string, any>): ProductItem {
         ? data.stockStatus
         : 'in_stock',
     warranty: String(data.warranty || ''),
-    lastRefreshedAt: timestampToIso(data.lastRefreshedAt),
+    lastRefreshedAt: refreshedIso || (hasPendingWrites ? new Date().toISOString() : createdIso),
     createdAt: createdIso,
-    updatedAt: timestampToIso(data.updatedAt || data.lastRefreshedAt || createdIso),
+    updatedAt: effectiveUpdatedAt,
     notes: String(data.notes || ''),
     barcodes: normalizeBarcodeList(data.barcodes),
   };
@@ -434,7 +445,7 @@ export function subscribeToSharedProducts(
   return onSnapshot(
     q,
     (snapshot) => {
-      const items = snapshot.docs.map((d) => mapDocToProduct(d.data()));
+      const items = snapshot.docs.map((d) => mapDocToProduct(d.data(), d.metadata.hasPendingWrites));
       items.sort((a, b) => {
         const aMs = a.createdAt ? Date.parse(a.createdAt) : NaN;
         const bMs = b.createdAt ? Date.parse(b.createdAt) : NaN;
@@ -521,6 +532,7 @@ export async function addProductToFirestore(
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 
+  const nowIso = new Date().toISOString();
   return {
     id: prodId,
     name: prodPayload.name,
@@ -533,8 +545,9 @@ export async function addProductToFirestore(
     customerQuoteToman: prodPayload.customerQuoteToman,
     stockStatus: prodPayload.stockStatus,
     warranty: prodPayload.warranty,
-    lastRefreshedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
+    lastRefreshedAt: nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
     notes: prodPayload.notes,
     barcodes: prodPayload.barcodes,
   };
@@ -591,6 +604,7 @@ export async function addBulkProductsToFirestore(
         warranty: prodPayload.warranty,
         lastRefreshedAt: nowIso,
         createdAt: nowIso,
+        updatedAt: nowIso,
         notes: prodPayload.notes,
         barcodes: prodPayload.barcodes,
       });
@@ -874,25 +888,48 @@ export async function applyBundleToFirestore(
       if (existing) {
         const normalizedBarcodes = normalizeBarcodeList(item.barcodes);
         const existingBarcodes = normalizeBarcodeList(existing.barcodes);
-        batch.update(prodRef, {
-          updatedBy: actorUid,
-          name: clampStr(item.name, 500, existing.name),
-          category: clampStr(item.category, 120, existing.category),
-          sourceUrl: clampStr(item.sourceUrl, 2048, existing.sourceUrl),
-          imageUrl: clampStr(item.imageUrl, 2048, existing.imageUrl),
-          currentPriceToman: price,
-          lastPriceToman: lastPrice,
-          marginPercent: margin,
-          customerQuoteToman: quote,
-          stockStatus,
-          warranty: clampStr(item.warranty, 200, ''),
-          notes: clampStr(item.notes, 1000, ''),
-          ...(normalizedBarcodes.length > 0 || existingBarcodes.length > 0
-            ? { barcodes: normalizedBarcodes }
-            : {}),
-          lastRefreshedAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        const nextName = clampStr(item.name, 500, existing.name);
+        const nextCategory = clampStr(item.category, 120, existing.category);
+        const nextSourceUrl = clampStr(item.sourceUrl, 2048, existing.sourceUrl);
+        const nextImageUrl = clampStr(item.imageUrl, 2048, existing.imageUrl);
+        const nextWarranty = clampStr(item.warranty, 200, '');
+        const nextNotes = clampStr(item.notes, 1000, '');
+
+        const hasProductChanges =
+          existing.name !== nextName ||
+          existing.category !== nextCategory ||
+          existing.sourceUrl !== nextSourceUrl ||
+          existing.imageUrl !== nextImageUrl ||
+          existing.currentPriceToman !== price ||
+          existing.lastPriceToman !== lastPrice ||
+          existing.marginPercent !== margin ||
+          existing.customerQuoteToman !== quote ||
+          existing.stockStatus !== stockStatus ||
+          existing.warranty !== nextWarranty ||
+          existing.notes !== nextNotes ||
+          JSON.stringify(existingBarcodes) !== JSON.stringify(normalizedBarcodes);
+
+        if (hasProductChanges) {
+          batch.update(prodRef, {
+            updatedBy: actorUid,
+            name: nextName,
+            category: nextCategory,
+            sourceUrl: nextSourceUrl,
+            imageUrl: nextImageUrl,
+            currentPriceToman: price,
+            lastPriceToman: lastPrice,
+            marginPercent: margin,
+            customerQuoteToman: quote,
+            stockStatus,
+            warranty: nextWarranty,
+            notes: nextNotes,
+            ...(normalizedBarcodes.length > 0 || existingBarcodes.length > 0
+              ? { barcodes: normalizedBarcodes }
+              : {}),
+            lastRefreshedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
 
         // Append any missing history snapshots recorded offline or on Cloudflare
         const existingEntries = existingHistoriesMap.get(safeProdId) || [];

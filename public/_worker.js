@@ -429,7 +429,8 @@ function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, X-Shop-Pin',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Authorization, X-Requested-With, X-Shop-Pin, X-Sync-Secret',
     'Access-Control-Allow-Private-Network': 'true',
   };
 }
@@ -504,6 +505,52 @@ async function isPinAuthorized(request, env, bodyPin) {
   return provided === expected;
 }
 
+function calculateCustomerQuoteEdge(priceToman, marginPercent) {
+  const price = Number(priceToman);
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  const rawMargin = Number(marginPercent);
+  const safeMargin =
+    marginPercent !== undefined &&
+    marginPercent !== null &&
+    Number.isFinite(rawMargin) &&
+    rawMargin >= 0
+      ? Math.min(500, rawMargin)
+      : 8;
+  return Math.round((price * (1 + safeMargin / 100)) / 1000) * 1000;
+}
+
+function extractSyncSecretToken(request) {
+  const xSyncSecret =
+    request.headers.get('X-Sync-Secret') || request.headers.get('x-sync-secret');
+  if (xSyncSecret && xSyncSecret.trim()) {
+    return xSyncSecret.trim();
+  }
+  const authHeader =
+    request.headers.get('Authorization') || request.headers.get('authorization') || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+  return '';
+}
+
+async function constantTimeEqual(a, b) {
+  const enc = new TextEncoder();
+  const aBytes = enc.encode(String(a));
+  const bBytes = enc.encode(String(b));
+  const [aDigest, bDigest] = await Promise.all([
+    crypto.subtle.digest('SHA-256', aBytes),
+    crypto.subtle.digest('SHA-256', bBytes),
+  ]);
+  const aView = new Uint8Array(aDigest);
+  const bView = new Uint8Array(bDigest);
+  let diff = aBytes.length ^ bBytes.length;
+  for (let i = 0; i < aView.length; i++) {
+    diff |= aView[i] ^ bView[i];
+  }
+  return diff === 0;
+}
+
 function normalizeBundle(raw) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   const histories = raw?.histories && typeof raw.histories === 'object' ? raw.histories : {};
@@ -515,6 +562,92 @@ function normalizeBundle(raw) {
     products,
     histories,
     deletedIds,
+  };
+}
+
+function buildSanitizedStoreCatalog(rawBundle) {
+  const bundle = normalizeBundle(rawBundle || {});
+  const rawDeletedIds =
+    bundle.deletedIds && typeof bundle.deletedIds === 'object' ? bundle.deletedIds : {};
+
+  const parseTimeMs = (val) => {
+    if (!val) return 0;
+    const ms = new Date(val).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  };
+
+  const deletedIdSet = new Set();
+  const activeIdSet = new Set();
+  const sanitizedProducts = [];
+
+  for (const p of bundle.products) {
+    if (!p || typeof p !== 'object' || !p.id) continue;
+    const id = String(p.id).trim();
+    if (!id) continue;
+
+    if (p.deleted === true || p.isDeleted === true || p.deletedAt) {
+      deletedIdSet.add(id);
+      continue;
+    }
+
+    const prodTime = parseTimeMs(p.updatedAt || p.lastRefreshedAt || p.createdAt);
+    const delRecord = rawDeletedIds[id];
+    if (delRecord) {
+      const delTime = parseTimeMs(delRecord);
+      if (delTime === 0 || delTime >= prodTime) {
+        deletedIdSet.add(id);
+        continue;
+      }
+    }
+
+    const currentPriceToman = Math.max(0, Number(p.currentPriceToman) || 0);
+    const rawMargin = p.marginPercent;
+    const marginPercent =
+      rawMargin !== undefined &&
+      rawMargin !== null &&
+      Number.isFinite(Number(rawMargin)) &&
+      Number(rawMargin) >= 0
+        ? Math.min(500, Number(rawMargin))
+        : 8;
+    const customerQuoteToman =
+      currentPriceToman > 0
+        ? Number(p.customerQuoteToman) > 0
+          ? Number(p.customerQuoteToman)
+          : calculateCustomerQuoteEdge(currentPriceToman, marginPercent)
+        : 0;
+    const stockStatus =
+      p.stockStatus === 'out_of_stock' || p.stockStatus === 'call' ? p.stockStatus : 'in_stock';
+
+    activeIdSet.add(id);
+    sanitizedProducts.push({
+      id,
+      name: String(p.name || ''),
+      category: String(p.category || ''),
+      sourceUrl: String(p.sourceUrl || ''),
+      imageUrl: String(p.imageUrl || ''),
+      currentPriceToman,
+      marginPercent,
+      customerQuoteToman,
+      stockStatus,
+      warranty: String(p.warranty || ''),
+      updatedAt: String(
+        p.updatedAt || p.lastRefreshedAt || p.createdAt || bundle.exportedAt || ''
+      ),
+    });
+  }
+
+  for (const rawId of Object.keys(rawDeletedIds)) {
+    const cleanId = String(rawId || '').trim();
+    if (cleanId && !activeIdSet.has(cleanId)) {
+      deletedIdSet.add(cleanId);
+    }
+  }
+
+  return {
+    success: true,
+    lastSyncedAt: bundle.exportedAt || new Date().toISOString(),
+    products: sanitizedProducts,
+    deletedIds: Array.from(deletedIdSet),
   };
 }
 
@@ -710,6 +843,57 @@ export default {
       }
     }
 
+    // 0.5 Secure Store Catalog Export for Storefront (Site 2): GET /api/store-catalog
+    if (url.pathname === '/api/store-catalog' && request.method === 'GET') {
+      const expectedSecret =
+        env && typeof env.STORE_SYNC_SECRET === 'string' ? env.STORE_SYNC_SECRET.trim() : '';
+      if (!expectedSecret) {
+        return jsonResponse(
+          {
+            success: false,
+            error: 'STORE_SYNC_SECRET روی سرور تنظیم نشده است.',
+          },
+          503
+        );
+      }
+
+      const providedToken = extractSyncSecretToken(request);
+      if (!providedToken || !(await constantTimeEqual(providedToken, expectedSecret))) {
+        return jsonResponse(
+          {
+            success: false,
+            error: 'دسترسی غیرمجاز: توکن همگام‌سازی نامعتبر یا ارسال نشده است.',
+          },
+          401
+        );
+      }
+
+      const { kv } = resolveShopKv(env);
+      if (!kv) {
+        return jsonResponse(
+          {
+            success: false,
+            error: 'حافظه Cloudflare KV متصل نشده است.',
+          },
+          503
+        );
+      }
+
+      try {
+        const stored = await kv.get(KV_BUNDLE_KEY, { type: 'json' });
+        const catalog = buildSanitizedStoreCatalog(stored);
+        return jsonResponse(catalog, 200);
+      } catch (err) {
+        return jsonResponse(
+          {
+            success: false,
+            error: err?.message || 'خطا در خواندن کاتالوگ از Cloudflare KV',
+          },
+          500
+        );
+      }
+    }
+
     // 1. API: POST /api/track-url
     if (url.pathname === '/api/track-url' && request.method === 'POST') {
       const t0 = Date.now();
@@ -777,7 +961,14 @@ export default {
     if (url.pathname === '/api/products' && request.method === 'POST') {
       try {
         const body = await request.json().catch(() => ({}));
-        const margin = Number(body.marginPercent ?? 8);
+        const rawMargin = body.marginPercent;
+        const margin =
+          rawMargin !== undefined &&
+          rawMargin !== null &&
+          Number.isFinite(Number(rawMargin)) &&
+          Number(rawMargin) >= 0
+            ? Math.min(500, Number(rawMargin))
+            : 8;
         const price = Number(body.currentPriceToman) || 0;
         const newProd = {
           id: body.id || `prod_${Date.now()}`,
@@ -789,10 +980,9 @@ export default {
             'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?auto=format&fit=crop&w=600&q=80',
           currentPriceToman: price,
           lastPriceToman: price,
-          marginPercent: Number.isFinite(margin) ? margin : 8,
+          marginPercent: margin,
           customerQuoteToman:
-            Number(body.customerQuoteToman) ||
-            Math.round((price * (1 + (Number.isFinite(margin) ? margin : 8) / 100)) / 1000) * 1000,
+            Number(body.customerQuoteToman) || calculateCustomerQuoteEdge(price, margin),
           stockStatus: body.stockStatus || 'in_stock',
           warranty: '',
           lastRefreshedAt: new Date().toISOString(),

@@ -38,6 +38,14 @@ export interface SchedulerInfo {
 export type StorageMode = 'firebase' | 'cloudflare' | 'offline';
 export type StoragePreference = 'auto' | 'firebase' | 'cloudflare';
 export type ConnectionHealthState = 'healthy' | 'degraded' | 'offline';
+export type CloudflareSyncState =
+  | 'idle'
+  | 'syncing'
+  | 'synced'
+  | 'pin_required'
+  | 'kv_missing'
+  | 'unreachable'
+  | 'error';
 
 export interface BackupBundle {
   version: number;

@@ -277,6 +277,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
     e.preventDefault();
     if (!name.trim() || priceToman <= 0) return;
 
+    const nowIso = new Date().toISOString();
     const newProdPayload = {
       id: `prod_${Date.now()}`,
       name: name.trim(),
@@ -291,8 +292,9 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
       customerQuoteToman: customerSellingPrice || priceToman,
       stockStatus: 'in_stock' as const,
       warranty: '',
-      lastRefreshedAt: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
+      lastRefreshedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
       notes: notes.trim(),
       barcodes,
     };

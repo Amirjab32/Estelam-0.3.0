@@ -68,6 +68,7 @@ import { FIXED_SCHEDULE_HOURS, getNextScheduledRefresh } from './utils/schedule.
 import {
   BackupBundle,
   CloudflareStatus,
+  CloudflareSyncState,
   ConnectionHealthState,
   PriceHistoryItem,
   ProductItem,
@@ -147,10 +148,18 @@ export default function App() {
   // Products, histories & sync states
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [histories, setHistories] = useState<Record<string, PriceHistoryItem[]>>({});
-  const [deletedIds, setDeletedIds] = useState<Record<string, string>>({});
+  const [deletedIds, setDeletedIds] = useState<Record<string, string>>(
+    () => loadOfflineBundle()?.deletedIds || {}
+  );
   const [loading, setLoading] = useState(true);
   const [isSyncingCloud, setIsSyncingCloud] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [lastCloudflareSyncedAt, setLastCloudflareSyncedAt] = useState<string | null>(null);
+  const [cloudflareSyncError, setCloudflareSyncError] = useState<string | null>(null);
+  const [isPushingCloudflare, setIsPushingCloudflare] = useState(false);
+  const [bannerPinInput, setBannerPinInput] = useState('');
+  const [bannerPinError, setBannerPinError] = useState<string | null>(null);
+  const [isUnlockingBannerPin, setIsUnlockingBannerPin] = useState(false);
 
   // View Layout mode: grid-4 | grid-3 | list | compact | large
   const [layout, setLayout] = useState<ViewLayout>(() => {
@@ -207,6 +216,8 @@ export default function App() {
   const productsRef = useRef<ProductItem[]>(products);
   const historiesRef = useRef<Record<string, PriceHistoryItem[]>>(histories);
   const deletedIdsRef = useRef<Record<string, string>>(deletedIds);
+  const lastCloudflareSyncedAtRef = useRef<string | null>(lastCloudflareSyncedAt);
+  const cloudflareSyncPendingRef = useRef<boolean>(false);
 
   useEffect(() => {
     firebaseReachableRef.current = firebaseReachable;
@@ -227,6 +238,9 @@ export default function App() {
   useEffect(() => {
     deletedIdsRef.current = deletedIds;
   }, [deletedIds]);
+  useEffect(() => {
+    lastCloudflareSyncedAtRef.current = lastCloudflareSyncedAt;
+  }, [lastCloudflareSyncedAt]);
 
   const toastTimerRef = useRef<number | null>(null);
   const showToast = useCallback((msg: string) => {
@@ -336,6 +350,17 @@ export default function App() {
   };
 
   const storageMode: StorageMode = resolveStorageMode();
+
+  const cloudflareSyncState: CloudflareSyncState = (() => {
+    if (!cfProbeDone) return 'idle';
+    if (isPushingCloudflare || isSyncingCloud) return 'syncing';
+    if (!cloudflareStatus.reachable) return 'unreachable';
+    if (!cloudflareStatus.kvConfigured) return 'kv_missing';
+    if (!savedPin || !pinVerified) return 'pin_required';
+    if (cloudflareSyncError) return 'error';
+    if (lastCloudflareSyncedAt) return 'synced';
+    return 'idle';
+  })();
 
   // Check whether user can view the main dashboard vs entry/PIN gate
   const hasDashboardAccess = (() => {
@@ -481,7 +506,7 @@ export default function App() {
       nextHistories: Record<string, PriceHistoryItem[]>,
       nextDeletedIds: Record<string, string>,
       sourceTag = 'shop-sync'
-    ) => {
+    ): Promise<boolean> => {
       const bundle: BackupBundle = {
         version: 1,
         exportedAt: new Date().toISOString(),
@@ -490,14 +515,85 @@ export default function App() {
         histories: nextHistories,
         deletedIds: nextDeletedIds,
       };
-      saveOfflineBundle(bundle);
-      setLastSyncedAt(bundle.exportedAt);
 
-      if (savedPin && cloudflareStatus.reachable && cloudflareStatus.kvConfigured) {
-        await pushCloudflareBundle(savedPin, bundle);
+      if (savedPin && pinVerified && cloudflareStatus.reachable && cloudflareStatus.kvConfigured) {
+        setIsPushingCloudflare(true);
+        try {
+          const pushRes = await pushCloudflareBundle(savedPin, {
+            ...bundle,
+            source:
+              sourceTag === 'dual-sync' || sourceTag === 'firebase-live'
+                ? 'cloudflare-kv'
+                : sourceTag,
+          });
+
+          if (pushRes.unauthorized) {
+            clearSavedShopPin();
+            setSavedPin('');
+            setPinVerified(false);
+            cloudflareSyncPendingRef.current = true;
+            setCloudflareSyncError('رمز فروشگاه کلادفلر منقضی یا نادرست است');
+            saveOfflineBundle({ ...bundle, source: 'offline-dirty' });
+            setLastSyncedAt(bundle.exportedAt);
+            return false;
+          }
+
+          if (!pushRes.kvConfigured) {
+            setCloudflareStatus((prev) => ({ ...prev, kvConfigured: false, kvBindingName: null }));
+            cloudflareSyncPendingRef.current = true;
+            setCloudflareSyncError('حافظه KV در Bindings کلادفلر متصل نیست');
+            saveOfflineBundle({ ...bundle, source: 'offline-dirty' });
+            setLastSyncedAt(bundle.exportedAt);
+            return false;
+          }
+
+          if (!pushRes.saved) {
+            cloudflareSyncPendingRef.current = true;
+            setCloudflareSyncError(pushRes.error || 'ارسال تغییرات به کلادفلر ناموفق بود');
+            saveOfflineBundle({ ...bundle, source: 'offline-dirty' });
+            setLastSyncedAt(bundle.exportedAt);
+            if (!pushRes.reachable) {
+              recordCloudflareFailure();
+            }
+            return false;
+          }
+
+          const syncedAt = new Date().toISOString();
+          cloudflareSyncPendingRef.current = false;
+          setCloudflareSyncError(null);
+          setLastCloudflareSyncedAt(syncedAt);
+          saveOfflineBundle({ ...bundle, exportedAt: syncedAt, source: sourceTag });
+          setLastSyncedAt(syncedAt);
+          recordCloudflareSuccess({
+            ...cloudflareStatus,
+            reachable: true,
+            kvConfigured: true,
+          });
+          return true;
+        } finally {
+          setIsPushingCloudflare(false);
+        }
       }
+
+      cloudflareSyncPendingRef.current = true;
+      if (cloudflareStatus.reachable && cloudflareStatus.kvConfigured && (!savedPin || !pinVerified)) {
+        setCloudflareSyncError('برای انتقال تغییرات به کلادفلر و سایت دوم، رمز فروشگاه لازم است');
+      } else if (cloudflareStatus.reachable && !cloudflareStatus.kvConfigured) {
+        setCloudflareSyncError('حافظه KV در Bindings کلادفلر متصل نیست');
+      } else if (!cloudflareStatus.reachable) {
+        setCloudflareSyncError('دسترسی به سرور کلادفلر برقرار نیست');
+      }
+      saveOfflineBundle({ ...bundle, source: 'offline-dirty' });
+      setLastSyncedAt(bundle.exportedAt);
+      return false;
     },
-    [savedPin, cloudflareStatus.reachable, cloudflareStatus.kvConfigured]
+    [
+      savedPin,
+      pinVerified,
+      cloudflareStatus,
+      recordCloudflareFailure,
+      recordCloudflareSuccess,
+    ]
   );
 
   // 3. Reconcile / Bidirectional sync between Firebase & Cloudflare KV
@@ -527,16 +623,24 @@ export default function App() {
 
         let unifiedBundle = fbBundle;
 
-        // Check offline pending changes saved while internet was completely down
+        // Check offline pending changes saved while internet or Cloudflare was down
         const offlineCached = loadOfflineBundle();
         if (offlineCached && offlineCached.source === 'offline-dirty') {
           unifiedBundle = mergeBundles(unifiedBundle, offlineCached, false);
         }
 
         // Check Cloudflare KV if reachable and PIN verified
-        if (savedPin && cloudflareStatus.reachable && cloudflareStatus.kvConfigured) {
+        if (savedPin && pinVerified && cloudflareStatus.reachable && cloudflareStatus.kvConfigured) {
           const cfRes = await fetchCloudflareBundle(savedPin);
-          if (cfRes.reachable && !cfRes.unauthorized && cfRes.bundle) {
+          if (cfRes.unauthorized) {
+            clearSavedShopPin();
+            setSavedPin('');
+            setPinVerified(false);
+            setCloudflareSyncError('رمز فروشگاه کلادفلر منقضی یا نادرست است');
+          } else if (cfRes.reachable && !cfRes.kvConfigured) {
+            setCloudflareStatus((prev) => ({ ...prev, kvConfigured: false, kvBindingName: null }));
+            setCloudflareSyncError('حافظه KV در Bindings کلادفلر متصل نیست');
+          } else if (cfRes.reachable && cfRes.bundle) {
             unifiedBundle = mergeBundles(unifiedBundle, cfRes.bundle, false);
           }
         }
@@ -550,26 +654,33 @@ export default function App() {
             if (!fp) return true;
             return (
               fp.currentPriceToman !== up.currentPriceToman ||
+              fp.customerQuoteToman !== up.customerQuoteToman ||
               fp.marginPercent !== up.marginPercent ||
               fp.notes !== up.notes ||
               fp.name !== up.name ||
               fp.category !== up.category ||
+              fp.sourceUrl !== up.sourceUrl ||
+              fp.imageUrl !== up.imageUrl ||
+              fp.warranty !== up.warranty ||
               fp.stockStatus !== up.stockStatus ||
               JSON.stringify(fp.barcodes || []) !== JSON.stringify(up.barcodes || [])
             );
           }) ||
           fbProducts.some((fp) => {
-            const delTime = unifiedBundle.deletedIds?.[fp.id]
-              ? new Date(unifiedBundle.deletedIds[fp.id]).getTime()
-              : 0;
-            const fpTime = new Date(fp.updatedAt || fp.lastRefreshedAt || fp.createdAt).getTime();
-            return delTime > fpTime;
+            const delIso = unifiedBundle.deletedIds?.[fp.id];
+            const delTime = delIso ? new Date(delIso).getTime() : 0;
+            const fpRawTime = new Date(
+              fp.updatedAt || fp.lastRefreshedAt || fp.createdAt
+            ).getTime();
+            const fpTime = Number.isFinite(fpRawTime) ? fpRawTime : 0;
+            return Number.isFinite(delTime) && delTime > fpTime;
           });
 
         if (hasDiffForFirebase) {
           await applyBundleToFirestore(firebaseUser.uid, unifiedBundle, 'replace');
         }
 
+        deletedIdsRef.current = unifiedBundle.deletedIds || {};
         setDeletedIds(unifiedBundle.deletedIds || {});
         setHistories(unifiedBundle.histories || {});
         await mirrorBundleToSecondary(
@@ -585,7 +696,13 @@ export default function App() {
         syncInFlightRef.current = false;
       }
     },
-    [savedPin, cloudflareStatus.reachable, cloudflareStatus.kvConfigured, mirrorBundleToSecondary]
+    [
+      savedPin,
+      pinVerified,
+      cloudflareStatus.reachable,
+      cloudflareStatus.kvConfigured,
+      mirrorBundleToSecondary,
+    ]
   );
 
   // 4. Primary Data Loader Effect based on active storageMode
@@ -727,6 +844,7 @@ export default function App() {
 
         const offlineCached = loadOfflineBundle();
         let activeBundle: BackupBundle;
+        let cfPushSucceeded = true;
 
         if (cfRes.kvConfigured && cfRes.bundle) {
           activeBundle =
@@ -735,26 +853,50 @@ export default function App() {
               : cfRes.bundle;
 
           if (offlineCached && offlineCached.source === 'offline-dirty') {
-            await pushCloudflareBundle(savedPin, activeBundle);
+            const pushRes = await pushCloudflareBundle(savedPin, activeBundle);
+            cfPushSucceeded = pushRes.saved;
           }
         } else if (offlineCached) {
           activeBundle = offlineCached;
           if (cfRes.kvConfigured) {
-            await pushCloudflareBundle(savedPin, activeBundle);
+            const pushRes = await pushCloudflareBundle(savedPin, activeBundle);
+            cfPushSucceeded = pushRes.saved;
+          } else {
+            cfPushSucceeded = false;
           }
         } else {
           activeBundle = createSeedOfflineBundle();
           if (cfRes.kvConfigured) {
-            await pushCloudflareBundle(savedPin, activeBundle);
+            const pushRes = await pushCloudflareBundle(savedPin, activeBundle);
+            cfPushSucceeded = pushRes.saved;
+          } else {
+            cfPushSucceeded = false;
           }
         }
 
         if (!isActive) return;
+        const nowSyncIso = new Date().toISOString();
+        deletedIdsRef.current = activeBundle.deletedIds || {};
         setProducts(activeBundle.products);
         setHistories(activeBundle.histories || {});
         setDeletedIds(activeBundle.deletedIds || {});
-        saveOfflineBundle({ ...activeBundle, source: 'cloudflare-kv' });
-        setLastSyncedAt(new Date().toISOString());
+        saveOfflineBundle({
+          ...activeBundle,
+          source: cfPushSucceeded ? 'cloudflare-kv' : 'offline-dirty',
+        });
+        setLastSyncedAt(nowSyncIso);
+        if (cfPushSucceeded && cfRes.kvConfigured) {
+          cloudflareSyncPendingRef.current = false;
+          setCloudflareSyncError(null);
+          setLastCloudflareSyncedAt(nowSyncIso);
+        } else {
+          cloudflareSyncPendingRef.current = true;
+          setCloudflareSyncError(
+            cfRes.kvConfigured
+              ? 'همگام‌سازی کامل با کلادفلر انجام نشد'
+              : 'حافظه KV در Bindings کلادفلر متصل نیست'
+          );
+        }
         setLoading(false);
       }
 
@@ -890,7 +1032,12 @@ export default function App() {
       const shouldProbeFb =
         (!fbUp || connectionHealth === 'degraded') && !isDenied && !inFirebaseCooldown;
       const shouldProbeCf =
-        !cfUp || connectionHealth !== 'healthy' || hasDirtyOfflineChanges || storagePreference !== 'firebase';
+        !cfUp ||
+        connectionHealth !== 'healthy' ||
+        hasDirtyOfflineChanges ||
+        cloudflareSyncPendingRef.current ||
+        !lastCloudflareSyncedAtRef.current ||
+        storagePreference !== 'firebase';
 
       if (!shouldProbeFb && !shouldProbeCf) return;
 
@@ -922,18 +1069,6 @@ export default function App() {
         }
       }
 
-      // If Firebase recovered and user is signed in & authorized, reconcile silently
-      if (fbOk && !isDenied && user && storagePreference !== 'cloudflare') {
-        const wasOffline = !fbUp;
-        if (wasOffline || hasDirtyOfflineChanges) {
-          await reconcileDualClouds(user, productsRef.current, historiesRef.current);
-          if (wasOffline) {
-            showToast('اتصال اینترنت برقرار شد؛ تغییرات زمان نت ملی به فایربیس و کلادفلر ادغام شد');
-          }
-        }
-        return;
-      }
-
       // If Cloudflare/Relay recovered and user has a stored PIN, verify automatically
       let isPinOk = pinVerified;
       if (cfStatus.reachable && savedPin && !isPinOk) {
@@ -946,7 +1081,26 @@ export default function App() {
           clearSavedShopPin();
           setSavedPin('');
           setPinVerified(false);
+          setCloudflareSyncError('رمز فروشگاه کلادفلر منقضی یا نادرست است');
         }
+      }
+
+      // If Firebase is reachable & user is signed in, reconcile with both Firebase & Cloudflare KV
+      if (fbOk && !isDenied && user && storagePreference !== 'cloudflare') {
+        const wasFbOffline = !fbUp;
+        const needsCfReconcile =
+          cfStatus.reachable &&
+          cfStatus.kvConfigured &&
+          savedPin &&
+          isPinOk &&
+          (cloudflareSyncPendingRef.current || !lastCloudflareSyncedAtRef.current || !cfUp);
+        if (wasFbOffline || hasDirtyOfflineChanges || needsCfReconcile) {
+          await reconcileDualClouds(user, productsRef.current, historiesRef.current);
+          if (wasFbOffline) {
+            showToast('اتصال اینترنت برقرار شد؛ تغییرات زمان نت ملی به فایربیس و کلادفلر ادغام شد');
+          }
+        }
+        return;
       }
 
       // Silent background sync of pending offline-dirty changes once Cloudflare/Relay is healthy
@@ -976,12 +1130,16 @@ export default function App() {
           merged.products.length !== productsRef.current.length ||
           JSON.stringify(merged.products) !== JSON.stringify(productsRef.current)
         ) {
+          deletedIdsRef.current = cleanBundle.deletedIds || {};
           setProducts(cleanBundle.products);
           setHistories(cleanBundle.histories);
           setDeletedIds(cleanBundle.deletedIds || {});
         }
         saveOfflineBundle(cleanBundle);
         setLastSyncedAt(cleanBundle.exportedAt);
+        setLastCloudflareSyncedAt(cleanBundle.exportedAt);
+        setCloudflareSyncError(null);
+        cloudflareSyncPendingRef.current = false;
         if (wasOffline) {
           showToast('تغییرات آفلاین به‌صورت خودکار در کلادفلر همگام شد');
         }
@@ -1095,12 +1253,15 @@ export default function App() {
       setSavedShopPin(rawPin);
       setSavedPin(rawPin);
       setPinVerified(true);
+      setCloudflareSyncError(null);
+      cloudflareSyncPendingRef.current = true;
+      initialFirebaseReconciledRef.current = false;
       setCloudflareStatus((prev) => ({
         ...prev,
         reachable: true,
         kvConfigured: res.kvConfigured,
       }));
-      showToast('رمز فروشگاه تایید و روی این سیستم ذخیره شد');
+      showToast('رمز فروشگاه تایید و همگام‌سازی با کلادفلر فعال شد');
       return { ok: true };
     }
     return { ok: false, error: res.error || 'رمز فروشگاه نادرست است' };
@@ -1115,6 +1276,7 @@ export default function App() {
       setSavedShopPin(newPin);
       setSavedPin(newPin);
       setPinVerified(true);
+      setCloudflareSyncError(null);
       showToast('رمز امنیتی فروشگاه با موفقیت تغییر یافت');
       return { ok: true };
     }
@@ -1140,10 +1302,29 @@ export default function App() {
     }
   };
 
+  const handleBannerPinUnlock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!bannerPinInput.trim()) return;
+    setBannerPinError(null);
+    setIsUnlockingBannerPin(true);
+    try {
+      const result = await handleVerifyAndSavePin(bannerPinInput.trim());
+      if (result.ok) {
+        setBannerPinInput('');
+      } else {
+        setBannerPinError(result.error || 'رمز فروشگاه نادرست است');
+      }
+    } finally {
+      setIsUnlockingBannerPin(false);
+    }
+  };
+
   const handleClearPin = () => {
     clearSavedShopPin();
     setSavedPin('');
     setPinVerified(false);
+    setLastCloudflareSyncedAt(null);
+    setCloudflareSyncError(null);
     showToast('رمز ذخیره‌شده کلادفلر از این دستگاه پاک شد');
   };
 
@@ -1261,15 +1442,43 @@ export default function App() {
       probeCloudflareStatus(),
     ]);
     setFirebaseReachable(fbOk);
-    setCloudflareStatus(cfStatus);
+    if (cfStatus.reachable) {
+      recordCloudflareSuccess(cfStatus);
+    } else {
+      setCloudflareStatus(cfStatus);
+    }
+
+    let isPinOk = pinVerified;
+    if (cfStatus.reachable && savedPin && !isPinOk) {
+      const pinCheck = await verifyShopPinOnEdge(savedPin);
+      if (pinCheck.valid) {
+        setPinVerified(true);
+        isPinOk = true;
+      } else if (pinCheck.unauthorized) {
+        clearSavedShopPin();
+        setSavedPin('');
+        setPinVerified(false);
+        setCloudflareSyncError('رمز فروشگاه کلادفلر منقضی یا نادرست است');
+      }
+    }
 
     if (fbOk && user) {
       await reconcileDualClouds(user, productsRef.current, historiesRef.current);
-      showToast('همگام‌سازی دوطرفه بین فایربیس، کلادفلر و حافظه محلی انجام شد');
+      if (!cfStatus.reachable) {
+        showToast('فایربیس همگام شد، اما سرور کلادفلر در دسترس نیست (سایت دوم هنوز بروزرسانی نشد)');
+      } else if (!cfStatus.kvConfigured) {
+        showToast('فایربیس همگام شد، اما حافظه KV کلادفلر متصل نیست');
+      } else if (!savedPin || !isPinOk) {
+        showToast('فایربیس همگام شد؛ برای ارسال تغییرات به کلادفلر و سایت دوم رمز فروشگاه را وارد کنید');
+      } else if (cloudflareSyncPendingRef.current) {
+        showToast('فایربیس همگام شد، اما انتقال به کلادفلر با خطا مواجه شد');
+      } else {
+        showToast('همگام‌سازی دوطرفه بین فایربیس، کلادفلر و حافظه محلی انجام شد');
+      }
       return;
     }
 
-    if (cfStatus.reachable && savedPin && pinVerified && cfStatus.kvConfigured) {
+    if (cfStatus.reachable && savedPin && isPinOk && cfStatus.kvConfigured) {
       setIsSyncingCloud(true);
       try {
         const currentBundle: BackupBundle = {
@@ -1285,15 +1494,22 @@ export default function App() {
           remote.bundle ? mergeBundles(currentBundle, remote.bundle, false) : currentBundle;
         const pushRes = await pushCloudflareBundle(savedPin, merged);
         if (!pushRes.saved) {
+          cloudflareSyncPendingRef.current = true;
+          setCloudflareSyncError(pushRes.error || 'خطا در ذخیره‌سازی در Cloudflare KV');
           saveOfflineBundle({ ...merged, source: 'offline-dirty' });
           showToast(pushRes.error || 'خطا در ذخیره‌سازی در Cloudflare KV');
           return;
         }
+        const syncedIso = new Date().toISOString();
+        deletedIdsRef.current = merged.deletedIds || {};
         setProducts(merged.products);
         setHistories(merged.histories);
         setDeletedIds(merged.deletedIds || {});
-        saveOfflineBundle({ ...merged, source: 'cloudflare-kv' });
-        setLastSyncedAt(new Date().toISOString());
+        saveOfflineBundle({ ...merged, exportedAt: syncedIso, source: 'cloudflare-kv' });
+        setLastSyncedAt(syncedIso);
+        setLastCloudflareSyncedAt(syncedIso);
+        setCloudflareSyncError(null);
+        cloudflareSyncPendingRef.current = false;
         showToast('همگام‌سازی ابری با کلادفلر KV با موفقیت انجام شد');
       } finally {
         setIsSyncingCloud(false);
@@ -1301,6 +1517,7 @@ export default function App() {
       return;
     }
 
+    cloudflareSyncPendingRef.current = true;
     saveOfflineBundle({
       version: 1,
       exportedAt: new Date().toISOString(),
@@ -1312,7 +1529,9 @@ export default function App() {
     showToast(
       cfStatus.reachable && !cfStatus.kvConfigured
         ? 'حافظه Cloudflare KV در Bindings متصل نیست؛ تغییرات فعلاً فقط در همین مرورگر ذخیره شد'
-        : 'تغییرات در حافظه محلی ذخیره شد (برای سینک ابری، به فایربیس یا کلادفلر متصل شوید)'
+        : cfStatus.reachable && (!savedPin || !isPinOk)
+          ? 'برای ارسال تغییرات به کلادفلر و سایت دوم، لطفاً رمز فروشگاه کلادفلر را وارد کنید'
+          : 'تغییرات در حافظه محلی ذخیره شد (برای سینک ابری، به فایربیس یا کلادفلر متصل شوید)'
     );
   };
 
@@ -1322,6 +1541,7 @@ export default function App() {
     nextHistories: Record<string, PriceHistoryItem[]>,
     nextDeletedIds: Record<string, string>
   ): Promise<{ cloudSaved: boolean; reason?: 'kv_not_configured' | 'unauthorized' | 'network_error' }> => {
+    deletedIdsRef.current = nextDeletedIds;
     setProducts(nextProducts);
     setHistories(nextHistories);
     setDeletedIds(nextDeletedIds);
@@ -1336,48 +1556,63 @@ export default function App() {
     };
 
     if (savedPin && pinVerified && cloudflareStatus.reachable && cloudflareStatus.kvConfigured) {
-      const pushRes = await pushCloudflareBundle(savedPin, {
-        ...bundle,
-        source: 'cloudflare-kv',
-      });
+      setIsPushingCloudflare(true);
+      try {
+        const pushRes = await pushCloudflareBundle(savedPin, {
+          ...bundle,
+          source: 'cloudflare-kv',
+        });
 
-      if (pushRes.unauthorized) {
-        clearSavedShopPin();
-        setSavedPin('');
-        setPinVerified(false);
-        saveOfflineBundle(bundle);
-        setLastSyncedAt(bundle.exportedAt);
-        return { cloudSaved: false, reason: 'unauthorized' };
+        if (pushRes.unauthorized) {
+          clearSavedShopPin();
+          setSavedPin('');
+          setPinVerified(false);
+          cloudflareSyncPendingRef.current = true;
+          setCloudflareSyncError('رمز فروشگاه کلادفلر منقضی یا نادرست است');
+          saveOfflineBundle(bundle);
+          setLastSyncedAt(bundle.exportedAt);
+          return { cloudSaved: false, reason: 'unauthorized' };
+        }
+
+        if (!pushRes.kvConfigured) {
+          setCloudflareStatus((prev) => ({ ...prev, kvConfigured: false, kvBindingName: null }));
+          cloudflareSyncPendingRef.current = true;
+          setCloudflareSyncError('حافظه KV در Bindings کلادفلر متصل نیست');
+          saveOfflineBundle(bundle);
+          setLastSyncedAt(bundle.exportedAt);
+          return { cloudSaved: false, reason: 'kv_not_configured' };
+        }
+
+        if (!pushRes.saved) {
+          cloudflareSyncPendingRef.current = true;
+          setCloudflareSyncError(pushRes.error || 'ارسال تغییرات به کلادفلر ناموفق بود');
+          saveOfflineBundle(bundle);
+          setLastSyncedAt(bundle.exportedAt);
+          recordCloudflareFailure();
+          return { cloudSaved: false, reason: 'network_error' };
+        }
+
+        const syncedBundle: BackupBundle = {
+          ...bundle,
+          source: 'cloudflare-kv',
+        };
+        saveOfflineBundle(syncedBundle);
+        setLastSyncedAt(syncedBundle.exportedAt);
+        setLastCloudflareSyncedAt(syncedBundle.exportedAt);
+        setCloudflareSyncError(null);
+        cloudflareSyncPendingRef.current = false;
+        recordCloudflareSuccess({
+          ...cloudflareStatus,
+          reachable: true,
+          kvConfigured: true,
+        });
+        return { cloudSaved: true };
+      } finally {
+        setIsPushingCloudflare(false);
       }
-
-      if (!pushRes.kvConfigured) {
-        setCloudflareStatus((prev) => ({ ...prev, kvConfigured: false, kvBindingName: null }));
-        saveOfflineBundle(bundle);
-        setLastSyncedAt(bundle.exportedAt);
-        return { cloudSaved: false, reason: 'kv_not_configured' };
-      }
-
-      if (!pushRes.saved) {
-        saveOfflineBundle(bundle);
-        setLastSyncedAt(bundle.exportedAt);
-        recordCloudflareFailure();
-        return { cloudSaved: false, reason: 'network_error' };
-      }
-
-      const syncedBundle: BackupBundle = {
-        ...bundle,
-        source: 'cloudflare-kv',
-      };
-      saveOfflineBundle(syncedBundle);
-      setLastSyncedAt(syncedBundle.exportedAt);
-      recordCloudflareSuccess({
-        ...cloudflareStatus,
-        reachable: true,
-        kvConfigured: true,
-      });
-      return { cloudSaved: true };
     }
 
+    cloudflareSyncPendingRef.current = true;
     saveOfflineBundle(bundle);
     setLastSyncedAt(bundle.exportedAt);
     return {
@@ -1642,6 +1877,7 @@ export default function App() {
         ...deletedIds,
         [target.id]: new Date().toISOString(),
       };
+      deletedIdsRef.current = nextDeletedIds;
       setDeletedIds(nextDeletedIds);
 
       if (storageMode === 'firebase' && user) {
@@ -2101,6 +2337,7 @@ export default function App() {
         connectionHealth={connectionHealth}
         userEmail={user?.email}
         isSyncingCloud={isSyncingCloud}
+        cloudflareSyncState={cloudflareSyncState}
       />
 
       {/* Net-Melli / Offline Status Banner (hidden during startup probes, healthy state & transient degraded retries) */}
@@ -2115,6 +2352,90 @@ export default function App() {
         onRetryConnection={handleRetryGateConnection}
         isRetrying={isRetryingConnection}
       />
+
+      {/* Cloudflare / Storefront Sync Warning Banner */}
+      {isBrowserOnline &&
+        storageMode !== 'offline' &&
+        cfProbeDone &&
+        (cloudflareSyncState === 'pin_required' ||
+          cloudflareSyncState === 'kv_missing' ||
+          cloudflareSyncState === 'unreachable' ||
+          cloudflareSyncState === 'error') && (
+          <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pt-3">
+            {cloudflareSyncState === 'pin_required' ? (
+              <div className="rounded-2xl bg-amber-950/50 border border-amber-700/60 px-4 py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 shadow-sm">
+                <div className="flex items-start gap-2.5 text-xs text-amber-100 leading-relaxed">
+                  <KeyRound className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold text-amber-200">
+                      تغییرات هنوز به کلادفلر (و سایت فروشگاهی دوم) منتقل نمی‌شوند:
+                    </span>{' '}
+                    شما فقط با حساب گوگل وارد شده‌اید و رمز کلادفلر روی این مرورگر ثبت نشده است. برای همگام‌سازی خودکار قیمت‌ها و کالاها با کلادفلر، رمز فروشگاه را وارد کنید.
+                    {bannerPinError && (
+                      <p className="text-[11px] text-rose-300 font-semibold mt-1">
+                        {bannerPinError}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <form
+                  onSubmit={handleBannerPinUnlock}
+                  className="flex items-center gap-2 shrink-0"
+                >
+                  <input
+                    type="password"
+                    value={bannerPinInput}
+                    onChange={(e) => setBannerPinInput(e.target.value)}
+                    placeholder="رمز کلادفلر..."
+                    className="w-36 sm:w-44 rounded-xl border border-amber-700/70 bg-slate-950/90 px-3 py-1.5 text-xs text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isUnlockingBannerPin || !bannerPinInput.trim()}
+                    className="px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold transition whitespace-nowrap"
+                  >
+                    {isUnlockingBannerPin ? 'بررسی...' : 'فعال‌سازی کلادفلر'}
+                  </button>
+                </form>
+              </div>
+            ) : cloudflareSyncState === 'kv_missing' ? (
+              <div className="rounded-2xl bg-amber-950/50 border border-amber-700/60 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-100">
+                <div className="flex items-center gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>
+                    حافظه <strong>Cloudflare KV</strong> متصل نیست؛ تغییرات در فایربیس ثبت می‌شوند اما به کلادفلر و سایت دوم منتقل نمی‌شوند.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={openDrawer}
+                  className="px-3 py-1.5 rounded-xl bg-amber-700/60 hover:bg-amber-600/80 text-white text-[11px] font-bold transition shrink-0"
+                >
+                  مشاهده راهنمای KV
+                </button>
+              </div>
+            ) : (
+              <div className="rounded-2xl bg-rose-950/45 border border-rose-700/60 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-rose-100">
+                <div className="flex items-center gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>
+                    انتقال تغییرات به کلادفلر (سایت دوم) با خطا مواجه شد
+                    {cloudflareSyncError ? `: ${cloudflareSyncError}` : '.'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleManualSyncNow}
+                  disabled={isSyncingCloud}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-[11px] font-bold transition shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCloud ? 'animate-spin' : ''}`} />
+                  <span>تلاش مجدد همگام‌سازی</span>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
@@ -2306,6 +2627,9 @@ export default function App() {
         layout={layout}
         onChangeLayout={handleLayoutChange}
         filteredProductsCount={filteredProducts.length}
+        cloudflareSyncState={cloudflareSyncState}
+        lastCloudflareSyncedAt={lastCloudflareSyncedAt}
+        cloudflareSyncError={cloudflareSyncError}
       />
 
       {/* MODALS */}

@@ -54,11 +54,11 @@ export function getNextScheduledRefresh(now: Date = new Date()): {
 
 /**
  * Calculate recommended customer price based on reference price, margin percentage, or fixed buffer.
- * Automatically rounds to standard thousands (e.g. 5,000 or 10,000 Tomans) for realistic pricing.
+ * Automatically rounds to the nearest 1,000 Tomans for consistent pricing across all storefronts.
  */
 export function calculateCustomerPrice(
   referencePriceToman: number,
-  marginPercent: number = 7,
+  marginPercent: number = 8,
   extraBufferToman: number = 0
 ): {
   customerPrice: number;
@@ -66,7 +66,7 @@ export function calculateCustomerPrice(
   roundedCustomerPrice: number;
   formattedPrice: string;
 } {
-  if (referencePriceToman <= 0) {
+  if (!Number.isFinite(referencePriceToman) || referencePriceToman <= 0) {
     return {
       customerPrice: 0,
       marginAmount: 0,
@@ -75,14 +75,13 @@ export function calculateCustomerPrice(
     };
   }
 
-  const marginAmount = Math.round(referencePriceToman * (marginPercent / 100)) + extraBufferToman;
+  const safeMargin =
+    Number.isFinite(marginPercent) && marginPercent >= 0 ? Math.min(500, marginPercent) : 8;
+  const safeBuffer = Number.isFinite(extraBufferToman) ? extraBufferToman : 0;
+  const rawCustomerPrice = referencePriceToman * (1 + safeMargin / 100) + safeBuffer;
+  const marginAmount = Math.round(referencePriceToman * (safeMargin / 100)) + safeBuffer;
   const customerPrice = referencePriceToman + marginAmount;
-
-  // Round up to nearest 5,000 or 10,000 Tomans to avoid awkward odd amounts
-  let rounded = customerPrice;
-  if (customerPrice > 50000) {
-    rounded = Math.ceil(customerPrice / 5000) * 5000;
-  }
+  const rounded = Math.round(rawCustomerPrice / 1000) * 1000;
 
   return {
     customerPrice,

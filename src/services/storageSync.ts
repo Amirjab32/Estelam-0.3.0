@@ -251,6 +251,8 @@ export function normalizeProductItem(raw: any, index = 0): ProductItem {
 
   const nowIso = new Date().toISOString();
   const createdAtIso = normalizeCreatedAt(raw?.createdAt);
+  const lastRefreshedIso = normalizeCreatedAt(raw?.lastRefreshedAt);
+  const updatedAtIso = normalizeCreatedAt(raw?.updatedAt);
   return {
     id: String(raw?.id || `prod_${Date.now()}_${index}`),
     name: String(raw?.name || 'کالای بدون نام').trim() || 'کالای بدون نام',
@@ -268,9 +270,9 @@ export function normalizeProductItem(raw: any, index = 0): ProductItem {
         ? raw.stockStatus
         : 'in_stock',
     warranty: String(raw?.warranty || ''),
-    lastRefreshedAt: String(raw?.lastRefreshedAt || nowIso),
+    lastRefreshedAt: lastRefreshedIso || createdAtIso || nowIso,
     createdAt: createdAtIso,
-    updatedAt: String(raw?.updatedAt || raw?.lastRefreshedAt || createdAtIso || nowIso),
+    updatedAt: updatedAtIso || lastRefreshedIso || createdAtIso || '',
     notes: String(raw?.notes || ''),
     barcodes: normalizeBarcodeList(raw?.barcodes),
   };

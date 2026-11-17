@@ -106,6 +106,13 @@ function getJalaliDateString(d: Date): { date: string; time: string } {
   return { date, time };
 }
 
+function calculateRoundedCustomerQuoteLocal(priceToman: number, marginPercent: number): number {
+  if (!Number.isFinite(priceToman) || priceToman <= 0) return 0;
+  const margin =
+    Number.isFinite(marginPercent) && marginPercent >= 0 ? Math.min(500, marginPercent) : 8;
+  return Math.round((priceToman * (1 + margin / 100)) / 1000) * 1000;
+}
+
 // Seed Initial Products if empty
 function initializeSeedData() {
   const existing = fs.readdirSync(DATA_DIR);
@@ -225,7 +232,7 @@ function initializeSeedData() {
         const v = variance[varIdx % stepCount] || 0;
         varIdx++;
         currentP = basePrice + v;
-        const custQuote = Math.round((currentP * (1 + product.marginPercent / 100)) / 10000) * 10000;
+        const custQuote = calculateRoundedCustomerQuoteLocal(currentP, product.marginPercent);
 
         const { date, time } = getJalaliDateString(timestampDate);
         history.push({
@@ -303,11 +310,19 @@ app.post('/api/products', (req, res) => {
       fs.mkdirSync(prodDir, { recursive: true });
     }
 
-    const margin = Number(body.marginPercent) || 8;
+    const rawMargin = body.marginPercent;
+    const margin =
+      rawMargin !== undefined &&
+      rawMargin !== null &&
+      Number.isFinite(Number(rawMargin)) &&
+      Number(rawMargin) >= 0
+        ? Math.min(500, Number(rawMargin))
+        : 8;
     const currentPrice = Number(body.currentPriceToman) || 0;
     const customerQuote =
-      body.customerQuoteToman ||
-      Math.ceil((currentPrice * (1 + margin / 100)) / 5000) * 5000;
+      Number(body.customerQuoteToman) > 0
+        ? Number(body.customerQuoteToman)
+        : calculateRoundedCustomerQuoteLocal(currentPrice, margin);
 
     const newProduct: ProductItem = {
       id,
@@ -1139,8 +1154,14 @@ async function syncProductPriceWithStore(
     prod.lastPriceToman = realPrice;
   }
 
-  const margin = prod.marginPercent || 8;
-  const newCustomerQuote = Math.ceil((realPrice * (1 + margin / 100)) / 5000) * 5000;
+  const margin =
+    prod.marginPercent !== undefined &&
+    prod.marginPercent !== null &&
+    Number.isFinite(Number(prod.marginPercent)) &&
+    Number(prod.marginPercent) >= 0
+      ? Math.min(500, Number(prod.marginPercent))
+      : 8;
+  const newCustomerQuote = calculateRoundedCustomerQuoteLocal(realPrice, margin);
   prod.customerQuoteToman = newCustomerQuote;
   prod.lastRefreshedAt = now.toISOString();
 
@@ -1285,8 +1306,14 @@ app.post('/api/simulation/test-price-change', async (req, res) => {
     const now = new Date();
     const { date, time } = getJalaliDateString(now);
 
-    const margin = currentProd.marginPercent || 8;
-    const newCustomerQuote = Math.ceil((targetPrice * (1 + margin / 100)) / 5000) * 5000;
+    const margin =
+      currentProd.marginPercent !== undefined &&
+      currentProd.marginPercent !== null &&
+      Number.isFinite(Number(currentProd.marginPercent)) &&
+      Number(currentProd.marginPercent) >= 0
+        ? Math.min(500, Number(currentProd.marginPercent))
+        : 8;
+    const newCustomerQuote = calculateRoundedCustomerQuoteLocal(targetPrice, margin);
 
     // Update product object
     currentProd.lastPriceToman = oldPrice;
@@ -1351,12 +1378,6 @@ app.post('/api/simulation/test-price-change', async (req, res) => {
 // Scheduler status & execution logic
 let lastAutoSyncTime: string | null = null;
 let lastSyncReport: { hour: number; totalChecked: number; priceChangedCount: number; timestamp: string } | null = null;
-
-function calculateRoundedCustomerQuoteLocal(priceToman: number, marginPercent: number): number {
-  if (!priceToman || priceToman <= 0) return 0;
-  const margin = Number.isFinite(marginPercent) ? marginPercent : 8;
-  return Math.round((priceToman * (1 + margin / 100)) / 1000) * 1000;
-}
 
 // Refresh synced offline/local bundle (shop_bundle_v1.json) used by Electron EXE & PWA
 async function syncLocalBundleFileThreeHour(triggerSource: string): Promise<{ checked: number; changed: number }> {

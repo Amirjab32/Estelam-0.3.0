@@ -12,7 +12,12 @@ import {
   FileText,
 } from 'lucide-react';
 import { toPersianDigits } from '../utils/jalali.ts';
-import { ConnectionHealthState, SchedulerInfo, StorageMode } from '../types.ts';
+import {
+  CloudflareSyncState,
+  ConnectionHealthState,
+  SchedulerInfo,
+  StorageMode,
+} from '../types.ts';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
 
 interface ShopHeaderProps {
@@ -30,6 +35,7 @@ interface ShopHeaderProps {
   connectionHealth?: ConnectionHealthState;
   userEmail?: string | null;
   isSyncingCloud?: boolean;
+  cloudflareSyncState?: CloudflareSyncState;
 }
 
 export const ShopHeader: React.FC<ShopHeaderProps> = ({
@@ -47,6 +53,7 @@ export const ShopHeader: React.FC<ShopHeaderProps> = ({
   connectionHealth = 'healthy',
   userEmail,
   isSyncingCloud = false,
+  cloudflareSyncState = 'idle',
 }) => {
   const modeLabel =
     storageMode === 'firebase'
@@ -102,10 +109,47 @@ export const ShopHeader: React.FC<ShopHeaderProps> = ({
                     <span className="hidden lg:inline text-slate-400">({userEmail})</span>
                   ) : null}
                 </button>
-                {isSyncingCloud ? (
+                {isSyncingCloud || cloudflareSyncState === 'syncing' ? (
                   <>
                     <span aria-hidden="true">·</span>
-                    <span className="text-cyan-400">در حال همگام‌سازی...</span>
+                    <span className="text-cyan-400">در حال همگام‌سازی کلادفلر...</span>
+                  </>
+                ) : cloudflareSyncState === 'synced' ? (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onOpenDrawer}
+                      className="text-emerald-400 hover:text-emerald-300 transition font-medium"
+                    >
+                      کلادفلر همگام
+                    </button>
+                  </>
+                ) : cloudflareSyncState === 'pin_required' ? (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onOpenDrawer}
+                      className="text-amber-300 hover:text-amber-200 transition font-medium"
+                    >
+                      کلادفلر قفل (نیاز به رمز)
+                    </button>
+                  </>
+                ) : cloudflareSyncState === 'kv_missing' ||
+                  cloudflareSyncState === 'error' ||
+                  cloudflareSyncState === 'unreachable' ? (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onOpenDrawer}
+                      className="text-rose-300 hover:text-rose-200 transition font-medium"
+                    >
+                      {cloudflareSyncState === 'kv_missing'
+                        ? 'کلادفلر بدون KV'
+                        : 'کلادفلر غیرفعال'}
+                    </button>
                   </>
                 ) : connectionHealth === 'degraded' && storageMode !== 'offline' ? (
                   <>

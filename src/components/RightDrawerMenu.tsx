@@ -25,6 +25,7 @@ import {
 import {
   BackupBundle,
   CloudflareStatus,
+  CloudflareSyncState,
   ConnectionHealthState,
   ProductItem,
   PriceHistoryItem,
@@ -67,6 +68,9 @@ interface RightDrawerMenuProps {
   layout: ViewLayout;
   onChangeLayout: (layout: ViewLayout) => void;
   filteredProductsCount: number;
+  cloudflareSyncState?: CloudflareSyncState;
+  lastCloudflareSyncedAt?: string | null;
+  cloudflareSyncError?: string | null;
 }
 
 const DRAWER_LAYOUT_OPTIONS: {
@@ -112,6 +116,9 @@ export const RightDrawerMenu: React.FC<RightDrawerMenuProps> = ({
   layout,
   onChangeLayout,
   filteredProductsCount,
+  cloudflareSyncState = 'idle',
+  lastCloudflareSyncedAt,
+  cloudflareSyncError,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [originDraft, setOriginDraft] = useState(cloudflareOrigin);
@@ -387,6 +394,35 @@ export const RightDrawerMenu: React.FC<RightDrawerMenuProps> = ({
                     </div>
                   </div>
                 </div>
+              </div>
+
+              <div className="px-3 py-2 rounded-xl bg-slate-900/90 border border-slate-800/80 flex items-center justify-between gap-2 text-[11px]">
+                <span className="text-slate-400">وضعیت انتقال به کلادفلر (سایت دوم):</span>
+                <span
+                  className={
+                    cloudflareSyncState === 'synced'
+                      ? 'text-emerald-400 font-bold'
+                      : cloudflareSyncState === 'syncing'
+                        ? 'text-cyan-300 font-bold'
+                        : cloudflareSyncState === 'pin_required'
+                          ? 'text-amber-300 font-bold'
+                          : 'text-rose-300 font-bold'
+                  }
+                >
+                  {cloudflareSyncState === 'synced'
+                    ? `همگام (${formatShortTime(lastCloudflareSyncedAt)})`
+                    : cloudflareSyncState === 'syncing'
+                      ? 'در حال انتقال...'
+                      : cloudflareSyncState === 'pin_required'
+                        ? 'قفل (نیاز به رمز کلادفلر)'
+                        : cloudflareSyncState === 'kv_missing'
+                          ? 'KV متصل نیست'
+                          : cloudflareSyncState === 'unreachable'
+                            ? 'کلادفلر در دسترس نیست'
+                            : cloudflareSyncError
+                              ? 'خطا در انتقال'
+                              : 'در انتظار همگام‌سازی'}
+                </span>
               </div>
 
               {/* 3-Way Selector */}

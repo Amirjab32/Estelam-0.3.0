@@ -27,12 +27,16 @@ test('getNextScheduledRefresh rolls over to 00:00 next day if after 21:00', () =
   assert.equal(next.targetDate.getDate(), 16);
 });
 
-test('calculateCustomerPrice applies margin and rounds correctly', () => {
+test('calculateCustomerPrice applies margin and rounds to nearest 1,000 Toman', () => {
   // 1,000,000 Toman with 10% margin -> 1,100,000
   const res = calculateCustomerPrice(1000000, 10);
   assert.equal(res.customerPrice, 1100000);
   assert.equal(res.marginAmount, 100000);
   assert.equal(res.roundedCustomerPrice, 1100000);
+
+  // 2,350,000 Toman with 8% margin -> 2,538,000 (nearest 1,000, not 5,000)
+  const res2 = calculateCustomerPrice(2350000, 8);
+  assert.equal(res2.roundedCustomerPrice, 2538000);
 });
 
 test('extractDigikalaProductCode extracts DKP id from various url patterns', () => {
